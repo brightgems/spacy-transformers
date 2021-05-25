@@ -1,7 +1,8 @@
 from typing import List, Dict, Union
 from pathlib import Path
+import os.path as osp
 import random
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, BertTokenizer
 from transformers.tokenization_utils import BatchEncoding
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 import catalogue
@@ -28,7 +29,11 @@ def huggingface_from_pretrained(source: Union[Path, str], config: Dict):
         str_path = str(source.absolute())
     else:
         str_path = source
-    tokenizer = AutoTokenizer.from_pretrained(str_path, **config)
+    bert_vocab_file = osp.join(str_path,'vocab.txt')
+    if osp.exists(bert_vocab_file):
+        tokenizer = BertTokenizer.from_pretrained(str_path, **config)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(str_path, **config)
     transformer = AutoModel.from_pretrained(str_path)
     ops = get_current_ops()
     if isinstance(ops, CupyOps):
