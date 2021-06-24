@@ -3,7 +3,7 @@ from typing import List, Dict, Union
 from pathlib import Path
 import os.path as osp
 import random
-from transformers import AutoModel, AutoTokenizer, BertTokenizer
+from transformers import AutoModel, AutoTokenizer, BertTokenizer, BertJapaneseTokenizer
 from transformers.tokenization_utils import BatchEncoding
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 import catalogue
@@ -32,9 +32,11 @@ def huggingface_from_pretrained(source: Union[Path, str], config: Dict):
         str_path = source
     # automatically load BertTokenizer if vocab.txt exists in model_name_or_path
     bert_vocab_file = 'vocab.txt'
-    if isinstance(str_path, str) and ('chinese' in str_path and \
-        osp.isdir(str_path) and osp.exists(osp.join(str_path, bert_vocab_file))):
-        tokenizer = BertTokenizer.from_pretrained(str_path, **config)
+    if isinstance(str_path, str) and  osp.isdir(str_path) and osp.exists(osp.join(str_path, bert_vocab_file)):
+        if('japanese' in str_path or 'ja_' in str_path):
+            tokenizer = BertJapaneseTokenizer.from_pretrained(str_path, **config)
+        else:
+            tokenizer = BertTokenizer.from_pretrained(str_path, **config)
     else:
         tokenizer = AutoTokenizer.from_pretrained(str_path, **config)
     transformer = AutoModel.from_pretrained(str_path)
