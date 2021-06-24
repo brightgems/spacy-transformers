@@ -32,7 +32,7 @@ def huggingface_from_pretrained(source: Union[Path, str], config: Dict):
         str_path = source
     # automatically load BertTokenizer if vocab.txt exists in model_name_or_path
     bert_vocab_file = 'vocab.txt'
-    if isinstance(str_path, str) and ('chinese' in str_path or \
+    if isinstance(str_path, str) and ('chinese' in str_path and \
         osp.isdir(str_path) and osp.exists(osp.join(str_path, bert_vocab_file))):
         tokenizer = BertTokenizer.from_pretrained(str_path, **config)
     else:
