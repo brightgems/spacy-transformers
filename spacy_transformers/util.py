@@ -32,11 +32,14 @@ def huggingface_from_pretrained(source: Union[Path, str], config: Dict):
         str_path = source
     # automatically load BertTokenizer if vocab.txt exists in model_name_or_path
     bert_vocab_file = 'vocab.txt'
-    if isinstance(str_path, str) and  osp.isdir(str_path) and osp.exists(osp.join(str_path, bert_vocab_file)):
-        if('japanese' in str_path or 'ja_' in str_path):
-            tokenizer = BertJapaneseTokenizer.from_pretrained(str_path, **config)
-        else:
-            tokenizer = BertTokenizer.from_pretrained(str_path, **config)
+    is_path = osp.isdir(str_path)
+    bert_tokenizer_class=None
+    if is_path and osp.exists(osp.join(str_path, bert_vocab_file)):
+        bert_tokenizer_class = BertJapaneseTokenizer if('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
+    elif not is_path and 'bert' in str_path:
+        bert_tokenizer_class = BertJapaneseTokenizer if('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
+    if bert_tokenizer_class:
+        tokenizer = bert_tokenizer_class.from_pretrained(str_path, **config)
     else:
         tokenizer = AutoTokenizer.from_pretrained(str_path, **config)
     transformer = AutoModel.from_pretrained(str_path)
