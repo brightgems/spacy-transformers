@@ -5,15 +5,13 @@ from spacy.pipeline.pipe import deserialize_config
 from spacy.tokens import Doc
 from spacy.vocab import Vocab
 from spacy.training import Example, validate_examples, validate_get_examples
-from spacy import util
+from spacy import util, Errors
 from spacy.util import minibatch
 from thinc.api import Model, Config, set_dropout_rate, Optimizer
 import srsly
-import torch
-from transformers import WEIGHTS_NAME, CONFIG_NAME
 from pathlib import Path
 
-from .util import huggingface_from_pretrained, batch_by_length
+from .util import batch_by_length
 from .annotation_setters import null_annotation_setter
 from .data_classes import FullTransformerBatch, TransformerData
 from .layers import TransformerListener
@@ -27,9 +25,12 @@ max_batch_items = 4096
 @annotation_setters = "spacy-transformers.null_annotation_setter.v1"
 
 [transformer.model]
-@architectures = "spacy-transformers.TransformerModel.v1"
+@architectures = "spacy-transformers.TransformerModel.v3"
 name = "roberta-base"
 tokenizer_config = {"use_fast": true}
+transformer_config = {}
+mixed_precision = false
+grad_scaler_config = {}
 
 [transformer.model.get_spans]
 @span_getters = "spacy-transformers.strided_spans.v1"
@@ -143,7 +144,9 @@ class Transformer(TrainablePipe):
         if self.model.has_dim("nO") and listener.has_dim("nO") is None:
             listener.set_dim("nO", self.model.get_dim("nO"))
 
-    def remove_listener(self, listener: TransformerListener, component_name: str) -> bool:
+    def remove_listener(
+        self, listener: TransformerListener, component_name: str
+    ) -> bool:
         """Remove a listener for a downstream component. Usually internals."""
         if component_name in self.listener_map:
             if listener in self.listener_map[component_name]:
@@ -167,7 +170,10 @@ class Transformer(TrainablePipe):
         names = ("*", self.name)
         if isinstance(getattr(component, "model", None), Model):
             for node in component.model.walk():
-                if isinstance(node, TransformerListener) and node.upstream_name in names:
+                if (
+                    isinstance(node, TransformerListener)
+                    and node.upstream_name in names
+                ):
                     self.add_listener(node, component.name)
 
     def __call__(self, doc: Doc) -> Doc:
@@ -296,9 +302,10 @@ class Transformer(TrainablePipe):
             nonlocal d_tensors
             for i, d_trf_data in enumerate(d_trf_datas):
                 for d_tensor in d_trf_data.tensors:
-                    losses[self.name] += float((d_tensor ** 2).sum())  # type: ignore
+                    # type: ignore
+                    losses[self.name] += float((d_tensor ** 2).sum())
                 if i >= len(d_tensors):
-                    d_tensors.append(d_trf_data.tensors)
+                    d_tensors.append(list(d_trf_data.tensors))
                 else:
                     for j, d_tensor in enumerate(d_trf_data.tensors):
                         d_tensors[i][j] += d_tensor
@@ -328,7 +335,10 @@ class Transformer(TrainablePipe):
         pass
 
     def initialize(
-        self, get_examples: Callable[[], Iterable[Example]], *, nlp: Optional[Language]
+        self,
+        get_examples: Callable[[], Iterable[Example]],
+        *,
+        nlp: Optional[Language] = None,
     ):
         """Initialize the pipe for training, using data examples if available.
 
@@ -358,20 +368,10 @@ class Transformer(TrainablePipe):
 
         DOCS: https://spacy.io/api/transformer#to_disk
         """
-
-        def save_model(p):
-            trf_dir = Path(p).absolute()
-            if not trf_dir.exists():
-                trf_dir.mkdir()
-            self.model.attrs["tokenizer"].save_pretrained(str(trf_dir))
-            transformer = self.model.layers[0].shims[0]._model
-            torch.save(transformer.state_dict(), trf_dir / WEIGHTS_NAME)
-            transformer.config.to_json_file(trf_dir / CONFIG_NAME)
-
         serialize = {}
         serialize["cfg"] = lambda p: srsly.write_json(p, self.cfg)
         serialize["vocab"] = lambda p: self.vocab.to_disk(p)
-        serialize["model"] = lambda p: save_model(p)
+        serialize["model"] = lambda p: self.model.to_disk(p)
         util.to_disk(path, serialize, exclude)
 
     def from_disk(
@@ -387,12 +387,11 @@ class Transformer(TrainablePipe):
         """
 
         def load_model(p):
-            p = Path(p).absolute()
-            tokenizer, transformer = huggingface_from_pretrained(
-                p, self.model.attrs["tokenizer_config"]
-            )
-            self.model.attrs["tokenizer"] = tokenizer
-            self.model.attrs["set_transformer"](self.model, transformer)
+            try:
+                with open(p, "rb") as mfile:
+                    self.model.from_bytes(mfile.read())
+            except AttributeError:
+                raise ValueError(Errors.E149) from None
 
         deserialize = {
             "vocab": self.vocab.from_disk,

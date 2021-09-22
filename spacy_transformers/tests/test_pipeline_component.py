@@ -1,17 +1,23 @@
 import pytest
+import torch
 from spacy.language import Language
 from spacy.training.example import Example
 from spacy.util import make_tempdir
 from spacy.vocab import Vocab
 from spacy.tokens import Doc
 from spacy import util
-from spacy_transformers.layers import TransformerListener
-from thinc.api import Model, Config
+from thinc.api import Model, Config, get_current_ops, NumpyOps
 from numpy.testing import assert_equal
+from spacy.tests.util import assert_docs_equal
 
 from .util import DummyTransformer
+from .. import TransformerModel
 from ..pipeline_component import Transformer
+from ..layers import TransformerListener
 from ..data_classes import TransformerData, FullTransformerBatch
+
+
+torch.set_num_threads(1)
 
 
 @pytest.fixture
@@ -58,11 +64,18 @@ def test_init(component):
 
 def test_predict(component, docs):
     trf_data = component.predict(docs)
-    assert isinstance(trf_data, FullTransformerBatch)
-    assert len(trf_data.tensors) == component.model.layers[0].attrs["depth"]
     n_tokens = trf_data.wordpieces.input_ids.shape[1]
     width = component.model.layers[0].attrs["width"]
-    assert trf_data.tensors[-1].shape == (len(docs), n_tokens, width)
+    assert isinstance(trf_data, FullTransformerBatch)
+    assert (
+        len(trf_data.model_output.last_hidden_state)
+        == component.model.layers[0].attrs["depth"]
+    )
+    assert trf_data.model_output.last_hidden_state[0].shape == (
+        len(docs),
+        n_tokens,
+        width,
+    )
 
 
 def test_set_annotations(component, docs):
@@ -94,8 +107,11 @@ def test_listeners(component, docs):
 
 
 TRAIN_DATA = [
-    ("I like green eggs", {"tags": ["N", "V", "J", "N"]}),
-    ("Eat blue ham", {"tags": ["V", "J", "N"]}),
+    (
+        "I like green eggs",
+        {"tags": ["N", "V", "J", "N"], "sent_starts": [True, False, True, False]},
+    ),
+    ("Eat blue ham", {"tags": ["V", "J", "N"], "sent_starts": [True, False, False]}),
 ]
 
 
@@ -110,18 +126,34 @@ def test_transformer_pipeline_long_token(simple_nlp):
     the model max length. We should truncate instead.
     """
     doc = simple_nlp("https://example.com/" + "a/" * 1000)
+    assert len(doc) == 1
 
 
 cfg_string = """
     [nlp]
     lang = "en"
-    pipeline = ["transformer","tagger"]
+    pipeline = ["transformer","tagger","senter"]
 
     [components]
 
+    [components.senter]
+    factory = "senter"
+
+    [components.senter.model]
+    @architectures = "spacy.Tagger.v1"
+    nO = null
+
+    [components.senter.model.tok2vec]
+    @architectures = "spacy-transformers.TransformerListener.v1"
+    grad_factor = 1.0
+    upstream = ${components.transformer.name}
+
+    [components.senter.model.tok2vec.pooling]
+    @layers = "reduce_mean.v1"
+
     [components.tagger]
     factory = "tagger"
-    
+
     [components.tagger.model]
     @architectures = "spacy.Tagger.v1"
     nO = null
@@ -130,21 +162,29 @@ cfg_string = """
     @architectures = "spacy-transformers.TransformerListener.v1"
     grad_factor = 1.0
     upstream = ${components.transformer.name}
-    
+
     [components.tagger.model.tok2vec.pooling]
     @layers = "reduce_mean.v1"
 
     [components.transformer]
     factory = "transformer"
     name = "custom_upstream"
+
+    [components.transformer.model]
+    @architectures = "spacy-transformers.TransformerModel.v3"
+    name = "albert-base-v2"
+
+    [components.transformer.model.transformer_config]
+    output_attentions = true
     """
 
 
-def test_transformer_pipeline_tagger():
-    """Test that a pipeline with just a transformer+tagger runs and trains properly"""
+def test_transformer_pipeline_tagger_senter_listener():
+    """Test that a pipeline with just a transformer+tagger+senter runs and
+    trains properly"""
     orig_config = Config().from_str(cfg_string)
     nlp = util.load_model_from_config(orig_config, auto_fill=True, validate=True)
-    assert nlp.pipe_names == ["transformer", "tagger"]
+    assert nlp.pipe_names == ["transformer", "tagger", "senter"]
     tagger = nlp.get_pipe("tagger")
     transformer = nlp.get_pipe("transformer")
     tagger_trf = tagger.model.get_ref("tok2vec").layers[0]
@@ -166,7 +206,8 @@ def test_transformer_pipeline_tagger():
         losses = {}
         nlp.update(train_examples, sgd=optimizer, losses=losses)
 
-    doc = nlp("We're interested at underwater basket weaving.")
+    text = "We're interested at underwater basket weaving."
+    doc = nlp(text)
     doc_tensor = tagger_trf.predict([doc])
     assert_equal(doc._.trf_data.tensors, doc_tensor[0].tensors)
 
@@ -175,11 +216,21 @@ def test_transformer_pipeline_tagger():
         file_path = d / "trained_nlp"
         nlp.to_disk(file_path)
         nlp2 = util.load_model_from_path(file_path)
-        doc = nlp2("We're interested at underwater basket weaving.")
+        doc = nlp2(text)
         tagger2 = nlp2.get_pipe("tagger")
         tagger_trf2 = tagger2.model.get_ref("tok2vec").layers[0]
         doc_tensor2 = tagger_trf2.predict([doc])
         assert_equal(doc_tensor2[0].tensors, doc_tensor[0].tensors)
+
+    # ensure to_bytes / from_bytes works
+    nlp_bytes = nlp.to_bytes()
+    nlp3 = util.load_model_from_config(orig_config, auto_fill=True, validate=True)
+    nlp3.from_bytes(nlp_bytes)
+    doc = nlp3(text)
+    tagger3 = nlp3.get_pipe("tagger")
+    tagger_trf3 = tagger3.model.get_ref("tok2vec").layers[0]
+    doc_tensor3 = tagger_trf3.predict([doc])
+    assert_equal(doc_tensor3[0].tensors, doc_tensor[0].tensors)
 
 
 def test_transformer_pipeline_empty():
@@ -226,5 +277,102 @@ def _assert_empty(trf_data):
     assert trf_data.wordpieces.strings == []
     assert trf_data.wordpieces.input_ids.size == 0
     assert trf_data.wordpieces.attention_mask.size == 0
-    assert trf_data.tensors == []
+    assert trf_data.tensors == ()
     assert len(trf_data.align.data) == 0
+
+
+def test_replace_listeners():
+    orig_config = Config().from_str(cfg_string)
+    nlp = util.load_model_from_config(orig_config, auto_fill=True, validate=True)
+    text = "This is awesome"
+    examples = [Example.from_dict(nlp.make_doc(text), {"tags": ["A", "B", "C"]})]
+    optimizer = nlp.initialize(lambda: examples)
+    # verify correct configuration with transformer listener
+    transformer = nlp.get_pipe("transformer")
+    tagger = nlp.get_pipe("tagger")
+    tagger_tok2vec = tagger.model.get_ref("tok2vec")
+    tagger_listener = tagger_tok2vec.get_ref("listener")
+    assert isinstance(tagger_listener, TransformerListener)
+    assert transformer.listener_map["tagger"][0] == tagger_listener
+    assert isinstance(transformer.model, TransformerModel)
+    assert (
+        nlp.config["components"]["transformer"]["model"]["@architectures"]
+        == "spacy-transformers.TransformerModel.v3"
+    )
+    assert (
+        nlp.config["components"]["tagger"]["model"]["tok2vec"]["@architectures"]
+        == "spacy-transformers.TransformerListener.v1"
+    )
+    # train pipe before replacing listeners
+    for i in range(2):
+        losses = {}
+        nlp.update(examples, sgd=optimizer, losses=losses)
+        doc = nlp(text)
+
+    preds = [t.tag_ for t in doc]
+    doc_tensor = tagger_tok2vec.predict([doc])
+
+    # replace listener and verify predictions are still the same
+    nlp.replace_listeners("transformer", "tagger", ["model.tok2vec"])
+    tagger = nlp.get_pipe("tagger")
+    tagger_tok2vec = tagger.model.get_ref("tok2vec")
+    assert isinstance(tagger_tok2vec, Model)
+    assert tagger_tok2vec.layers[0].layers[0].name == "transformer"
+    assert (
+        nlp.config["components"]["tagger"]["model"]["tok2vec"]["@architectures"]
+        == "spacy-transformers.Tok2VecTransformer.v3"
+    )
+    doc2 = nlp(text)
+    assert preds == [t.tag_ for t in doc2]
+    assert_equal(doc_tensor, tagger_tok2vec.predict([doc2]))
+    # attempt training with the new pipeline
+    optimizer = nlp.resume_training()
+    for i in range(2):
+        losses = {}
+        nlp.update(examples, sgd=optimizer, losses=losses)
+        assert losses["tagger"] > 0.0
+
+    # check for presence of additional fields in model_output
+    assert doc2._.trf_data.model_output.pooler_output is not None
+    assert doc2._.trf_data.model_output.attentions is not None
+
+
+def test_replace_listeners_invalid():
+    orig_config = Config().from_str(cfg_string)
+    nlp = util.load_model_from_config(orig_config, auto_fill=True, validate=True)
+    text = "This is awesome"
+    examples = [Example.from_dict(nlp.make_doc(text), {"tags": ["A", "B", "C"]})]
+    optimizer = nlp.initialize(lambda: examples)
+    for i in range(2):
+        losses = {}
+        nlp.update(examples, sgd=optimizer, losses=losses)
+    with pytest.raises(ValueError):
+        nlp.replace_listeners("invalid", "tagger", ["model.tok2vec"])
+    with pytest.raises(ValueError):
+        nlp.replace_listeners("transformer", "parser", ["model.tok2vec"])
+    with pytest.raises(ValueError):
+        nlp.replace_listeners("transformer", "tagger", ["model.yolo"])
+    with pytest.raises(ValueError):
+        nlp.replace_listeners("transformer", "tagger", ["model.tok2vec", "model.yolo"])
+
+
+@pytest.fixture
+def texts():
+    data = [
+        "Hello world.",
+        "This is spacy.",
+        "You can use multiprocessing with pipe method.",
+        "Please try!",
+    ]
+    return data
+
+
+def test_multiprocessing(simple_nlp, texts):
+    ops = get_current_ops()
+    if isinstance(ops, NumpyOps):
+        texts = texts * 3
+        expecteds = [simple_nlp(text) for text in texts]
+        docs = simple_nlp.pipe(texts, n_process=2, batch_size=2)
+
+        for doc, expected_doc in zip(docs, expecteds):
+            assert_docs_equal(doc, expected_doc)
