@@ -3,13 +3,16 @@ from typing import List, Dict, Union
 from pathlib import Path
 import os.path as osp
 import random
-from transformers import AutoModel, AutoTokenizer, BertTokenizer, BertJapaneseTokenizer
+from transformers import AutoModel, AutoConfig, AutoTokenizer, BertTokenizer, BertJapaneseTokenizer
 from transformers.tokenization_utils import BatchEncoding
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 import catalogue
 from spacy.util import registry
 from thinc.api import get_current_ops, CupyOps
 import torch.cuda
+import tempfile
+import shutil
+import contextlib
 
 
 # fmt: off
@@ -18,13 +21,16 @@ registry.annotation_setters = catalogue.create("spacy", "annotation_setters", en
 # fmt: on
 
 
-def huggingface_from_pretrained(source: Union[Path, str], config: Dict):
+def huggingface_from_pretrained(
+    source: Union[Path, str], tok_config: Dict, trf_config: Dict
+):
     """Create a Huggingface transformer model from pretrained weights. Will
     download the model if it is not already downloaded.
 
     source (Union[str, Path]): The name of the model or a path to it, such as
         'bert-base-cased'.
-    config (dict): Settings to pass to the tokenizer.
+    tok_config (dict): Settings to pass to the tokenizer.
+    trf_config (dict): Settings to pass to the transformer.
     """
     if hasattr(source, "absolute"):
         str_path = str(source.absolute())
@@ -32,14 +38,19 @@ def huggingface_from_pretrained(source: Union[Path, str], config: Dict):
         str_path = source
     # automatically load BertTokenizer if vocab.txt exists in model_name_or_path
     bert_vocab_file = 'vocab.txt'
-    if isinstance(str_path, str) and  osp.isdir(str_path) and osp.exists(osp.join(str_path, bert_vocab_file)):
-        if('japanese' in str_path or 'ja_' in str_path):
-            tokenizer = BertJapaneseTokenizer.from_pretrained(str_path, **config)
-        else:
-            tokenizer = BertTokenizer.from_pretrained(str_path, **config)
+    is_path = osp.isdir(str_path)
+    bert_tokenizer_class=None
+    if is_path and osp.exists(osp.join(str_path, bert_vocab_file)):
+        bert_tokenizer_class = BertJapaneseTokenizer if('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
+    elif not is_path and 'bert' in str_path:
+        bert_tokenizer_class = BertJapaneseTokenizer if('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
+    if bert_tokenizer_class:
+        tokenizer = bert_tokenizer_class.from_pretrained(str_path, **tok_config)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(str_path, **config)
-    transformer = AutoModel.from_pretrained(str_path)
+        tokenizer = AutoTokenizer.from_pretrained(str_path, **tok_config)
+    trf_config["return_dict"] = True
+    configs = AutoConfig.from_pretrained(str_path, **trf_config)
+    transformer = AutoModel.from_pretrained(str_path, config=configs)
     ops = get_current_ops()
     if isinstance(ops, CupyOps):
         transformer.cuda()
@@ -48,12 +59,16 @@ def huggingface_from_pretrained(source: Union[Path, str], config: Dict):
 
 def huggingface_tokenize(tokenizer, texts: List[str]) -> BatchEncoding:
     """Apply a Huggingface tokenizer to a batch of texts."""
+
+    # Use NumPy arrays rather than PyTorch tensors to avoid a lot of
+    # host <-> device transfers during tokenization and post-processing
+    # when a GPU is used.
     token_data = tokenizer(
         texts,
         add_special_tokens=True,
         return_attention_mask=True,
         return_offsets_mapping=isinstance(tokenizer, PreTrainedTokenizerFast),
-        return_tensors="pt",
+        return_tensors="np",
         return_token_type_ids=None,  # Sets to model default
         padding="longest",
     )
@@ -74,17 +89,6 @@ def maybe_flush_pytorch_cache(chance: float = 1.0):
     """
     if random.random() < chance and torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-
-def find_last_hidden(tensors) -> int:
-    """Find the index of the hidden layer in a list of activation tensors.
-    Internals.
-    """
-    for i, tensor in reversed(list(enumerate(tensors))):
-        if len(tensor.shape) == 3:
-            return i
-    else:
-        raise ValueError("No 3d tensors")
 
 
 def transpose_list(nested_list):
@@ -144,3 +148,15 @@ def log_batch_size(logger, token_data, is_train):
         logger.info(f"{batch_size} x {seq_len} ({squared}) update")
     else:
         logger.info(f"{batch_size} x {seq_len} ({squared}) predict")
+
+
+@contextlib.contextmanager
+def make_tempdir():
+    """Execute a block in a temporary directory and remove the directory and
+    its contents at the end of the with block.
+
+    YIELDS (Path): The path of the temp directory.
+    """
+    d = Path(tempfile.mkdtemp())
+    yield d
+    shutil.rmtree(str(d))
