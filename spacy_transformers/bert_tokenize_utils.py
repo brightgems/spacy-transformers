@@ -130,7 +130,7 @@ def align_text_labels(text, labels, max_seq_len=100):
     return zip(tokened_chars, char_labels, char_sentids)
 
 
-def jsonl_to_conll(dic, max_seq_len=100, cut_sent=False):
+def jsonl_to_conll(dic, max_seq_len=120, cut_sent=False):
     """convert json to conll text
 
     Args:
@@ -149,7 +149,9 @@ def jsonl_to_conll(dic, max_seq_len=100, cut_sent=False):
     for char, label, sent_id in data:
         if cur_sentid != sent_id:
             conll_data.append(doc_delimiter)
-            conll_data.append('{0} {1}'.format(char, label))
+            # remove SENT_END_CHAR at first postion of sentence
+            if char != SENT_END_CHAR:
+                conll_data.append('{0} {1}'.format(char, label))
             cur_sentid = sent_id
         else:
             if cut_sent and char == SENT_END_CHAR:
