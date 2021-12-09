@@ -134,9 +134,9 @@ def jsonl_to_conll(dic, max_seq_len=120, cut_sent=False):
     """convert json to conll text
 
     Args:
-        dic ([type]): [description]
-        max_seq_len (int, optional): [description]. Defaults to 100.
-
+        dic ([type]): a json with key text and labels
+        max_seq_len (int, optional): max length of a sentence. Defaults to 100.
+        cut_sent: if true, replace line return char with special token, so the bert can look at end of sent
     Returns:
         text in conll format
     """
