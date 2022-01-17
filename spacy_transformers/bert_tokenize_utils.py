@@ -152,7 +152,7 @@ def jsonl_to_conll(dic, max_seq_len=100, cut_sent=False):
             conll_data.append('{0} {1}'.format(char, label))
             cur_sentid = sent_id
         else:
-            if cut_sent and char == SENT_END_CHAR:
+            if char == SENT_END_CHAR:
                 conll_data.append('')
             else:
                 conll_data.append('{0} {1}'.format(char, label))
