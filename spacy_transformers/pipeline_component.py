@@ -1,16 +1,18 @@
 from typing import List, Callable, Iterable, Iterator, Optional, Dict, Union
+import warnings
 from spacy.language import Language
 from spacy.pipeline.trainable_pipe import TrainablePipe
 from spacy.pipeline.pipe import deserialize_config
 from spacy.tokens import Doc
 from spacy.vocab import Vocab
-from spacy.training import Example, validate_examples, validate_get_examples
+from spacy.training import Example, validate_examples
 from spacy import util, Errors
 from spacy.util import minibatch
 from thinc.api import Model, Config, set_dropout_rate, Optimizer
 import srsly
 from pathlib import Path
 
+from .layers.transformer_model import huggingface_from_pretrained
 from .util import batch_by_length
 from .annotation_setters import null_annotation_setter
 from .data_classes import FullTransformerBatch, TransformerData
@@ -219,14 +221,12 @@ class Transformer(TrainablePipe):
 
         DOCS: https://spacy.io/api/transformer#predict
         """
+        docs = list(docs)
         if not any(len(doc) for doc in docs):
             # Handle cases where there are no tokens in any docs.
             activations = FullTransformerBatch.empty(len(docs))
         else:
             activations = self.model.predict(docs)
-        batch_id = TransformerListener.get_batch_id(docs)
-        for listener in self.listeners:
-            listener.receive(batch_id, activations.doc_data, None)
         return activations
 
     def set_annotations(
@@ -244,7 +244,7 @@ class Transformer(TrainablePipe):
         doc_data = list(predictions.doc_data)
         for doc, data in zip(docs, doc_data):
             doc._.trf_data = data
-        self.set_extra_annotations(docs, predictions)
+        self.set_extra_annotations(list(docs), predictions)
 
     def update(
         self,
@@ -292,7 +292,7 @@ class Transformer(TrainablePipe):
             return losses
         set_dropout_rate(self.model, drop)
         trf_full, bp_trf_full = self.model.begin_update(docs)
-        d_tensors = []
+        d_tensors: List = []
         losses.setdefault(self.name, 0.0)
 
         def accumulate_gradient(d_trf_datas: List[TransformerData]):
@@ -302,8 +302,7 @@ class Transformer(TrainablePipe):
             nonlocal d_tensors
             for i, d_trf_data in enumerate(d_trf_datas):
                 for d_tensor in d_trf_data.tensors:
-                    # type: ignore
-                    losses[self.name] += float((d_tensor ** 2).sum())
+                    losses[self.name] += float((d_tensor**2).sum())  # type:ignore
                 if i >= len(d_tensors):
                     d_tensors.append(list(d_trf_data.tensors))
                 else:
@@ -315,7 +314,7 @@ class Transformer(TrainablePipe):
             nonlocal d_tensors
             accumulate_gradient(d_trf_datas)
             d_trf_full = trf_full.unsplit_by_doc(d_tensors)
-            d_docs = bp_trf_full(d_trf_full)
+            d_docs = bp_trf_full(d_trf_full)  # type: ignore
             if sgd is not None:
                 self.model.finish_update(sgd)
             d_tensors = []
@@ -348,7 +347,6 @@ class Transformer(TrainablePipe):
 
         DOCS: https://spacy.io/api/transformer#initialize
         """
-        validate_get_examples(get_examples, "Transformer.initialize")
         docs = [Doc(Vocab(), words=["hello"])]
         self.model.initialize(X=docs)
         if nlp is not None:
@@ -392,11 +390,28 @@ class Transformer(TrainablePipe):
                     self.model.from_bytes(mfile.read())
             except AttributeError:
                 raise ValueError(Errors.E149) from None
+            except (IsADirectoryError, PermissionError):
+                warn_msg = (
+                    "Automatically converting a transformer component "
+                    "from spacy-transformers v1.0 to v1.1+. If you see errors "
+                    "or degraded performance, download a newer compatible "
+                    "model or retrain your custom model with the current "
+                    "spacy-transformers version. For more details and "
+                    "available updates, run: python -m spacy validate"
+                )
+                warnings.warn(warn_msg)
+                p = Path(p).absolute()
+                hf_model = huggingface_from_pretrained(
+                    p,
+                    self.model._init_tokenizer_config,
+                    self.model._init_transformer_config,
+                )
+                self.model.attrs["set_transformer"](self.model, hf_model)
 
         deserialize = {
             "vocab": self.vocab.from_disk,
             "cfg": lambda p: self.cfg.update(deserialize_config(p)),
             "model": load_model,
         }
-        util.from_disk(path, deserialize, exclude)
+        util.from_disk(path, deserialize, exclude)  # type: ignore
         return self

@@ -1,4 +1,5 @@
 import pytest
+import copy
 import spacy
 from spacy import Language
 from spacy.lang.en import English
@@ -7,17 +8,17 @@ from spacy.tokens import Doc
 from spacy.util import make_tempdir
 from spacy import util
 import srsly
-from thinc.api import Config
+from thinc.api import Config, get_current_ops
 from numpy.testing import assert_array_equal
 
 from .. import TransformerData
-from ..util import make_tempdir
 
 
 DEFAULT_CONFIG = {
     "model": {
         "@architectures": "spacy-transformers.TransformerModel.v3",
-        "name": "distilbert-base-uncased",
+        "name": "hf-internal-testing/tiny-random-DistilBertModel",
+        "tokenizer_config": {"use_fast": False},
     }
 }
 
@@ -33,7 +34,7 @@ def test_serialize_transformer_data():
         "transformer",
         config={
             "model": {
-                "name": "distilbert-base-uncased",
+                "name": "hf-internal-testing/tiny-random-DistilBertModel",
                 "transformer_config": {"output_attentions": True},
             }
         },
@@ -44,9 +45,11 @@ def test_serialize_transformer_data():
     reloaded_doc = Doc(nlp.vocab)
     reloaded_doc.from_bytes(b)
     assert_docs_equal(doc, reloaded_doc)
+    ops = get_current_ops()
     for key in doc._.trf_data.model_output:
         assert_array_equal(
-            doc._.trf_data.model_output[key], reloaded_doc._.trf_data.model_output[key]
+            ops.to_numpy(ops.asarray(doc._.trf_data.model_output[key])),
+            ops.to_numpy(ops.asarray(reloaded_doc._.trf_data.model_output[key])),
         )
 
 
@@ -70,6 +73,8 @@ def test_initialized_transformer_tobytes():
     trf2 = nlp2.add_pipe("transformer", config=DEFAULT_CONFIG)
     trf2.from_bytes(trf_bytes)
 
+    assert trf2.model.tokenizer.is_fast is False
+
 
 def test_initialized_transformer_todisk():
     nlp = Language()
@@ -80,6 +85,21 @@ def test_initialized_transformer_todisk():
         nlp2 = Language()
         trf2 = nlp2.add_pipe("transformer", config=DEFAULT_CONFIG)
         trf2.from_disk(d)
+
+        assert trf2.model.tokenizer.is_fast is False
+
+    fast_config = copy.deepcopy(DEFAULT_CONFIG)
+    fast_config["model"]["tokenizer_config"]["use_fast"] = True
+    nlp = Language()
+    trf = nlp.add_pipe("transformer", config=fast_config)
+    nlp.initialize()
+    with make_tempdir() as d:
+        trf.to_disk(d)
+        nlp2 = Language()
+        trf2 = nlp2.add_pipe("transformer", config=fast_config)
+        trf2.from_disk(d)
+
+        assert trf2.model.tokenizer.is_fast is True
 
 
 def test_transformer_pipeline_tobytes():
@@ -114,9 +134,12 @@ def test_transformer_pipeline_todisk_settings():
     assert trf.model.transformer.config.output_attentions is False
     assert "attentions" not in nlp("test")._.trf_data.model_output
     # modify model_max_length (note that modifications to
-    # tokenizer.model_max_length are not serialized by save_pretrained
-    # see: https://github.com/explosion/spaCy/discussions/7393)
+    # tokenizer.model_max_length for transformers<4.25 are not serialized by
+    # save_pretrained, see: https://github.com/explosion/spaCy/discussions/7393)
     trf.model.tokenizer.init_kwargs["model_max_length"] = 499
+    # transformer>=4.25, model_max_length is saved and init_kwargs changes are
+    # clobbered, so do both for this test
+    trf.model.tokenizer.model_max_length = 499
     # add attentions on-the-fly
     trf.model.transformer.config.output_attentions = True
     assert nlp("test")._.trf_data.model_output.attentions is not None
@@ -163,7 +186,7 @@ inline_cfg_string = """
 
     [components.tagger.model.tok2vec]
     @architectures = "spacy-transformers.Tok2VecTransformer.v3"
-    name = "distilbert-base-uncased"
+    name = "hf-internal-testing/tiny-random-DistilBertModel"
     tokenizer_config = {"use_fast": true}
     transformer_config = {"output_attentions": false}
     grad_factor = 1.0

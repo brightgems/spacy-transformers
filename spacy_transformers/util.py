@@ -1,5 +1,5 @@
 import os.path as osp
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Set
 from pathlib import Path
 import os.path as osp
 import random
@@ -8,42 +8,47 @@ from transformers.tokenization_utils import BatchEncoding
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 import catalogue
 from spacy.util import registry
-from thinc.api import get_current_ops, CupyOps
+from thinc.api import get_torch_default_device
 import torch.cuda
 import tempfile
 import shutil
 import contextlib
+import warnings
 
 
 # fmt: off
-registry.span_getters = catalogue.create("spacy", "span_getters", entry_points=True)
-registry.annotation_setters = catalogue.create("spacy", "annotation_setters", entry_points=True)
+registry.span_getters = catalogue.create("spacy", "span_getters", entry_points=True)  # type: ignore
+registry.annotation_setters = catalogue.create("spacy", "annotation_setters", entry_points=True)  # type: ignore
 # fmt: on
 
 
-def huggingface_from_pretrained(
-    source: Union[Path, str], tok_config: Dict, trf_config: Dict
-):
+def huggingface_from_pretrained(source: Union[Path, str], config: Dict):
     """Create a Huggingface transformer model from pretrained weights. Will
     download the model if it is not already downloaded.
 
     source (Union[str, Path]): The name of the model or a path to it, such as
         'bert-base-cased'.
-    tok_config (dict): Settings to pass to the tokenizer.
-    trf_config (dict): Settings to pass to the transformer.
+    config (dict): Settings to pass to the tokenizer.
     """
-    if hasattr(source, "absolute"):
+    warnings.warn(
+        "spacy_transformers.util.huggingface_from_pretrained has been moved to "
+        "spacy_transformers.layers.transformer_model.huggingface_from_pretrained "
+        "with an updated API:\n"
+        "huggingface_from_pretrained(source, tok_config, trf_config) -> HFObjects",
+        DeprecationWarning,
+    )
+    if isinstance(source, Path):
         str_path = str(source.absolute())
     else:
         str_path = source
     # automatically load BertTokenizer if vocab.txt exists in model_name_or_path
     bert_vocab_file = 'vocab.txt'
     is_path = osp.isdir(str_path)
-    bert_tokenizer_class=None
+    bert_tokenizer_class = None
     if is_path and osp.exists(osp.join(str_path, bert_vocab_file)):
-        bert_tokenizer_class = BertJapaneseTokenizer if('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
+        bert_tokenizer_class = BertJapaneseTokenizer if ('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
     elif not is_path and 'bert' in str_path:
-        bert_tokenizer_class = BertJapaneseTokenizer if('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
+        bert_tokenizer_class = BertJapaneseTokenizer if ('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
     if bert_tokenizer_class:
         tokenizer = bert_tokenizer_class.from_pretrained(str_path, **tok_config)
     else:
@@ -51,9 +56,8 @@ def huggingface_from_pretrained(
     trf_config["return_dict"] = True
     configs = AutoConfig.from_pretrained(str_path, **trf_config)
     transformer = AutoModel.from_pretrained(str_path, config=configs)
-    ops = get_current_ops()
-    if isinstance(ops, CupyOps):
-        transformer.cuda()
+    torch_device = get_torch_default_device()
+    transformer.to(torch_device)
     return tokenizer, transformer
 
 
@@ -63,6 +67,11 @@ def huggingface_tokenize(tokenizer, texts: List[str]) -> BatchEncoding:
     # Use NumPy arrays rather than PyTorch tensors to avoid a lot of
     # host <-> device transfers during tokenization and post-processing
     # when a GPU is used.
+    warnings.warn(
+        "spacy_transformers.util.huggingface_tokenize has been moved to "
+        "spacy_transformers.layers.transformer_model.huggingface_tokenize.",
+        DeprecationWarning,
+    )
     token_data = tokenizer(
         texts,
         add_special_tokens=True,
@@ -125,7 +134,7 @@ def batch_by_length(seqs, max_words: int) -> List[List[int]]:
     # Check lengths match
     assert sum(len(b) for b in batches) == len(seqs)
     # Check no duplicates
-    seen = set()
+    seen: Set[int] = set()
     for b in batches:
         seen.update(id(item) for item in b)
     assert len(seen) == len(seqs)
@@ -135,14 +144,14 @@ def batch_by_length(seqs, max_words: int) -> List[List[int]]:
 
 
 def log_gpu_memory(logger, context):
-    mem = torch.cuda.memory_allocated() // 1024 ** 2
+    mem = torch.cuda.memory_allocated() // 1024**2
     logger.info(f"{mem:.1f}: {context}")
 
 
 def log_batch_size(logger, token_data, is_train):
     batch_size = token_data["input_ids"].shape[0]
     seq_len = token_data["input_ids"].shape[1]
-    squared = seq_len ** 2 * batch_size
+    squared = seq_len**2 * batch_size
 
     if is_train:
         logger.info(f"{batch_size} x {seq_len} ({squared}) update")
