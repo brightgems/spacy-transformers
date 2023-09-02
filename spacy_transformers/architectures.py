@@ -6,6 +6,7 @@ from spacy.tokens import Doc
 from .layers import TransformerModel, TransformerListener
 from .layers import trfs2arrays, split_trf_batch
 from .util import registry
+from .data_classes import FullTransformerBatch
 
 
 @registry.architectures.register("spacy-transformers.TransformerListener.v1")
@@ -38,7 +39,7 @@ def transformer_listener_tok2vec_v1(
         string will almost always be fine.
     """
     listener = TransformerListener(upstream_name=upstream)
-    model = chain(listener, trfs2arrays(pooling, grad_factor))
+    model: Model = chain(listener, trfs2arrays(pooling, grad_factor))
     model.set_ref("listener", listener)
     return model
 
@@ -75,15 +76,14 @@ def transformer_tok2vec_v1(
     )
 
 
-# Note: when updating, also make sure to update 'replace_listener_cfg' in _util.py
 @registry.architectures.register("spacy-transformers.Tok2VecTransformer.v2")
 def transformer_tok2vec_v2(
     name: str,
     get_spans,
     tokenizer_config: dict,
-    transformer_config: dict,
     pooling: Model[Ragged, Floats2d],
     grad_factor: float = 1.0,
+    transformer_config: dict = {},
 ) -> Model[List[Doc], List[Floats2d]]:
     """Use a transformer as a "Tok2Vec" layer directly. This does not allow
     multiple components to share the transformer weights, and does not allow
@@ -94,15 +94,15 @@ def transformer_tok2vec_v2(
         spans from the batch of Doc objects. See the "TransformerModel" layer
         for details.
     tokenizer_config (dict): Settings to pass to the transformers tokenizer.
-    transformers_config (dict): Settings to pass to the transformers forward pass
-        of the transformer.
     pooling (Model[Ragged, Floats2d]): A reduction layer used to calculate
         the token vectors based on zero or more wordpiece vectors. If in doubt,
         mean pooling (see `thinc.layers.reduce_mean`) is usually a good choice.
-     grad_factor (float): Reweight gradients from the component before passing
+    grad_factor (float): Reweight gradients from the component before passing
         them to the transformer. You can set this to 0 to "freeze" the transformer
         weights with respect to the component, or to make it learn more slowly.
         Leaving it at 1.0 is usually fine.
+    transformers_config (dict): Settings to pass to the transformers forward pass
+        of the transformer.
     """
     return chain(
         TransformerModel(name, get_spans, tokenizer_config, transformer_config),
@@ -117,9 +117,9 @@ def transformer_tok2vec_v3(
     name: str,
     get_spans,
     tokenizer_config: dict,
-    transformer_config: dict,
     pooling: Model[Ragged, Floats2d],
     grad_factor: float = 1.0,
+    transformer_config: dict = {},
     mixed_precision: bool = False,
     grad_scaler_config: dict = {},
 ) -> Model[List[Doc], List[Floats2d]]:
@@ -132,8 +132,6 @@ def transformer_tok2vec_v3(
         spans from the batch of Doc objects. See the "TransformerModel" layer
         for details.
     tokenizer_config (dict): Settings to pass to the transformers tokenizer.
-    transformers_config (dict): Settings to pass to the transformers forward pass
-        of the transformer.
     pooling (Model[Ragged, Floats2d]): A reduction layer used to calculate
         the token vectors based on zero or more wordpiece vectors. If in doubt,
         mean pooling (see `thinc.layers.reduce_mean`) is usually a good choice.
@@ -141,6 +139,8 @@ def transformer_tok2vec_v3(
         them to the transformer. You can set this to 0 to "freeze" the transformer
         weights with respect to the component, or to make it learn more slowly.
         Leaving it at 1.0 is usually fine.
+    transformers_config (dict): Settings to pass to the transformers forward pass
+        of the transformer.
     mixed_precision (bool): Enable mixed-precision. Mixed-precision replaces
         whitelisted ops to half-precision counterparts. This speeds up training
         and prediction on modern GPUs and reduces GPU memory use.
@@ -158,16 +158,20 @@ def transformer_tok2vec_v3(
         the scale should be increased when no overflows were found for
         `growth_interval` steps.
     """
-    return chain(
-        TransformerModel(
-            name,
-            get_spans,
-            tokenizer_config,
-            transformer_config,
-            mixed_precision,
-            grad_scaler_config,
+    # Note that this is a chain of chain on purpose, to match the structure of
+    # TransformerListener.v1 after it is run through replace_listener (cf PR #310)
+    return chain(  # type: ignore
+        chain(
+            TransformerModel(
+                name,
+                get_spans,
+                tokenizer_config,
+                transformer_config,
+                mixed_precision,
+                grad_scaler_config,
+            ),
+            split_trf_batch(),
         ),
-        split_trf_batch(),
         trfs2arrays(pooling, grad_factor),
     )
 
@@ -177,7 +181,7 @@ def create_TransformerModel_v1(
     name: str,
     get_spans: Callable,
     tokenizer_config: dict = {},
-) -> Model[List[Doc], "FullTransformerBatch"]:
+) -> Model[List[Doc], FullTransformerBatch]:
     model = TransformerModel(name, get_spans, tokenizer_config)
     return model
 
@@ -188,7 +192,7 @@ def create_TransformerModel_v2(
     get_spans: Callable,
     tokenizer_config: dict = {},
     transformer_config: dict = {},
-) -> Model[List[Doc], "FullTransformerBatch"]:
+) -> Model[List[Doc], FullTransformerBatch]:
     model = TransformerModel(name, get_spans, tokenizer_config, transformer_config)
     return model
 
@@ -201,7 +205,7 @@ def create_TransformerModel_v3(
     transformer_config: dict = {},
     mixed_precision: bool = False,
     grad_scaler_config: dict = {},
-) -> Model[List[Doc], "FullTransformerBatch"]:
+) -> Model[List[Doc], FullTransformerBatch]:
     """Pretrained transformer model that can be finetuned for downstream tasks.
 
     name (str): Name of the pretrained Huggingface model to use.

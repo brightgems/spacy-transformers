@@ -1,10 +1,11 @@
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Any, Union, Tuple
+from typing import Optional, List, Dict, Any, Union, Tuple, cast
+from dataclasses import dataclass, field
 import torch
 import numpy
 from transformers.tokenization_utils import BatchEncoding
 from transformers.file_utils import ModelOutput
-from thinc.types import Ragged, Floats2d, Floats3d, FloatsXd, Ints2d
+from transformers.modeling_outputs import BaseModelOutput
+from thinc.types import Ragged, Floats2d, Floats3d, FloatsXd, Ints1d, Ints2d
 from thinc.api import NumpyOps, get_array_module, xp2torch, torch2xp
 from spacy.tokens import Span
 import srsly
@@ -98,16 +99,20 @@ class WordpieceBatch:
             for tokens in token_data["input_texts"]
         ]
 
+        # The following tensors are intentionally allocated on the CPU to reduce
+        # host-to-device copies.
         numpy_ops = NumpyOps()
+        input_ids = token_data["input_ids"]
+        token_type_ids = token_data.get("token_type_ids")
 
         return cls(
             strings=token_data["input_texts"],
-            input_ids=numpy_ops.asarray2i(token_data["input_ids"]),
+            input_ids=numpy_ops.asarray(input_ids, dtype=input_ids.dtype),
             attention_mask=numpy_ops.asarray2f(token_data["attention_mask"]),
             lengths=lengths,
             token_type_ids=(
-                numpy_ops.asarray2i(token_data["token_type_ids"])
-                if "token_type_ids" in token_data
+                numpy_ops.asarray(token_type_ids, dtype=token_type_ids.dtype)
+                if token_type_ids is not None
                 else None
             ),
         )
@@ -158,7 +163,10 @@ class TransformerData:
 
     @classmethod
     def empty(cls) -> "TransformerData":
-        align = Ragged(numpy.zeros((0,), dtype="i"), numpy.zeros((0,), dtype="i"))
+        align = Ragged(
+            cast(Ints1d, numpy.zeros((0,), dtype="i")),
+            cast(Ints1d, numpy.zeros((0,), dtype="i")),
+        )
         return cls(
             wordpieces=WordpieceBatch.empty(), model_output=ModelOutput(), align=align
         )
@@ -172,7 +180,10 @@ class TransformerData:
             model_output=ModelOutput(
                 last_hidden_state=xp.zeros((1, length, width), dtype="f")
             ),
-            align=Ragged(numpy.arange(length), numpy.ones((length,), dtype="i")),
+            align=Ragged(
+                cast(Ints1d, numpy.arange(length)),
+                cast(Ints1d, numpy.ones((length,), dtype="i")),
+            ),
         )
 
     @property
@@ -187,7 +198,7 @@ class TransformerData:
     @property
     def width(self) -> int:
         if "last_hidden_state" in self.model_output:
-            return self.model_output.last_hidden_state.shape[-1]
+            return cast(BaseModelOutput, self.model_output).last_hidden_state.shape[-1]
         else:
             raise ValueError("Cannot find last hidden state")
 
@@ -258,9 +269,12 @@ class FullTransformerBatch:
 
     @classmethod
     def empty(cls, nr_docs) -> "FullTransformerBatch":
-        spans = [[] for _ in range(nr_docs)]
+        spans: List[List[Span]] = [[] for _ in range(nr_docs)]
         doc_data = [TransformerData.empty() for _ in range(nr_docs)]
-        align = Ragged(numpy.zeros((0,), dtype="i"), numpy.zeros((0,), dtype="i"))
+        align = Ragged(
+            cast(Ints1d, numpy.zeros((0,), dtype="i")),
+            cast(Ints1d, numpy.zeros((0,), dtype="i")),
+        )
         return cls(
             spans=spans,
             wordpieces=WordpieceBatch.empty(),
@@ -314,6 +328,21 @@ class FullTransformerBatch:
         for doc_spans in self.spans:
             flat_spans.extend(doc_spans)
         token_positions = get_token_positions(flat_spans)
+
+        # Convert all outputs to XP arrays.
+        xp_model_output = ModelOutput()
+        last_hidden_state = cast(BaseModelOutput, self.model_output).last_hidden_state
+        for key, output in self.model_output.items():
+            if isinstance(output, torch.Tensor):
+                xp_model_output[key] = torch2xp(output)
+            elif (
+                isinstance(output, tuple)
+                and all(isinstance(t, torch.Tensor) for t in output)
+                and all(t.shape[0] == last_hidden_state.shape[0] for t in output)
+            ):
+                xp_model_output[key] = [torch2xp(t) for t in output]
+
+        # Split outputs per Doc.
         outputs = []
         start = 0
         prev_tokens = 0
@@ -328,16 +357,13 @@ class FullTransformerBatch:
             doc_align = self.align[start_i:end_i]
             doc_align.data = doc_align.data - prev_tokens
             model_output = ModelOutput()
-            last_hidden_state = self.model_output.last_hidden_state
-            for key, output in self.model_output.items():
-                if isinstance(output, torch.Tensor):
-                    model_output[key] = torch2xp(output[start:end])
-                elif (
-                    isinstance(output, tuple)
-                    and all(isinstance(t, torch.Tensor) for t in output)
-                    and all(t.shape[0] == last_hidden_state.shape[0] for t in output)
-                ):
-                    model_output[key] = [torch2xp(t[start:end]) for t in output]
+            for key, output in xp_model_output.items():
+                # After the torch2xp conversion above, we only have XP arrays
+                # and lists of XP arrays.
+                if not isinstance(output, list):
+                    model_output[key] = output[start:end]
+                else:
+                    model_output[key] = [t[start:end] for t in output]
             outputs.append(
                 TransformerData(
                     wordpieces=doc_tokens,
@@ -348,3 +374,13 @@ class FullTransformerBatch:
             prev_tokens += doc_tokens.input_ids.size
             start += len(doc_spans)
         return outputs
+
+
+@dataclass
+class HFObjects:
+
+    tokenizer: Any
+    transformer: Any
+    vocab_file_contents: Any
+    _init_tokenizer_config: Dict[str, Any] = field(default_factory=dict)
+    _init_transformer_config: Dict[str, Any] = field(default_factory=dict)

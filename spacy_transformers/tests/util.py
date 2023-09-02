@@ -1,15 +1,24 @@
 from typing import Dict, List, Union
+import numpy
 import torch
 import copy
 from transformers.file_utils import ModelOutput
+from numpy.testing import assert_array_equal
 
 from spacy.tokens import Doc
-from thinc.api import Model
+from thinc.api import Model, get_current_ops
 
-from ..data_classes import FullTransformerBatch
-from ..layers.hf_shim import HFObjects
+from ..data_classes import FullTransformerBatch, HFObjects
 from ..span_getters import get_doc_spans
 from ..layers.transformer_model import forward as transformer_forward
+
+
+def _assert_equal_tensors(tensors1, tensors2):
+    ops = get_current_ops()
+    for i in range(len(tensors1)):
+        t1 = ops.asarray(tensors1[i])
+        t2 = ops.asarray(tensors2[i])
+        assert_array_equal(ops.to_numpy(t1), ops.to_numpy(t2))
 
 
 class DummyTokenizer:
@@ -47,7 +56,6 @@ class DummyTokenizer:
             "input_ids": [],
             "attention_mask": [],
             "token_type_ids": [],
-            "offset_mapping": [],
         }  # type: ignore
 
         for text in texts:
@@ -56,13 +64,16 @@ class DummyTokenizer:
             output["input_ids"].append(ids)
             output["attention_mask"].append(mask)
             output["token_type_ids"].append(type_ids)
-            output["offset_mapping"].append(offsets)
         if padding:
             output = self._pad(output)
         if return_tensors == "pt":
             output["input_ids"] = torch.tensor(output["input_ids"])  # type: ignore
             output["attention_mask"] = torch.tensor(output["attention_mask"])  # type: ignore
             output["token_type_ids"] = torch.tensor(output["token_type_ids"])  # type: ignore
+        elif return_tensors == "np":
+            output["input_ids"] = numpy.asarray(output["input_ids"])  # type: ignore
+            output["attention_mask"] = numpy.asarray(output["attention_mask"])  # type: ignore
+            output["token_type_ids"] = numpy.asarray(output["token_type_ids"])  # type: ignore
         if return_length:
             output["length"] = torch.tensor([len(x) for x in output["input_ids"]])  # type: ignore
         return output
@@ -79,7 +90,6 @@ class DummyTokenizer:
             batch["attention_mask"][i] = [1] * length + [0] * difference
             batch["input_ids"][i].extend([0] * difference)
             batch["token_type_ids"][i].extend([2] * difference)
-            batch["offset_mapping"][i].extend([None] * difference)
         return batch
 
     def _tokenize(self, text):
@@ -127,7 +137,7 @@ def DummyTransformer(
     depth: int = 2, width: int = 4, get_spans=get_doc_spans
 ) -> Model[List[Doc], FullTransformerBatch]:
     """Create a test model that produces a FullTransformerBatch object."""
-    hf_model = HFObjects(DummyTokenizer(), None)
+    hf_model = HFObjects(DummyTokenizer(), None, None)
 
     return DummyModel(
         "dummy-transformer",

@@ -1,5 +1,7 @@
 import pytest
+from packaging.version import Version
 import torch
+import spacy
 from spacy.language import Language
 from spacy.training.example import Example
 from spacy.util import make_tempdir
@@ -7,10 +9,9 @@ from spacy.vocab import Vocab
 from spacy.tokens import Doc
 from spacy import util
 from thinc.api import Model, Config, get_current_ops, NumpyOps
-from numpy.testing import assert_equal
 from spacy.tests.util import assert_docs_equal
 
-from .util import DummyTransformer
+from .util import DummyTransformer, _assert_equal_tensors
 from .. import TransformerModel
 from ..pipeline_component import Transformer
 from ..layers import TransformerListener
@@ -146,7 +147,7 @@ cfg_string = """
     [components.senter.model.tok2vec]
     @architectures = "spacy-transformers.TransformerListener.v1"
     grad_factor = 1.0
-    upstream = ${components.transformer.name}
+    upstream = "transformer"
 
     [components.senter.model.tok2vec.pooling]
     @layers = "reduce_mean.v1"
@@ -161,14 +162,13 @@ cfg_string = """
     [components.tagger.model.tok2vec]
     @architectures = "spacy-transformers.TransformerListener.v1"
     grad_factor = 1.0
-    upstream = ${components.transformer.name}
+    upstream = "transformer"
 
     [components.tagger.model.tok2vec.pooling]
     @layers = "reduce_mean.v1"
 
     [components.transformer]
     factory = "transformer"
-    name = "custom_upstream"
 
     [components.transformer.model]
     @architectures = "spacy-transformers.TransformerModel.v3"
@@ -190,7 +190,6 @@ def test_transformer_pipeline_tagger_senter_listener():
     tagger_trf = tagger.model.get_ref("tok2vec").layers[0]
     assert isinstance(transformer, Transformer)
     assert isinstance(tagger_trf, TransformerListener)
-    assert tagger_trf.upstream_name == "custom_upstream"
     train_examples = []
     for t in TRAIN_DATA:
         train_examples.append(Example.from_dict(nlp.make_doc(t[0]), t[1]))
@@ -198,7 +197,6 @@ def test_transformer_pipeline_tagger_senter_listener():
             tagger.add_label(tag)
 
     # Check that the Transformer component finds it listeners
-    assert transformer.listeners == []
     optimizer = nlp.initialize(lambda: train_examples)
     assert tagger_trf in transformer.listeners
 
@@ -209,28 +207,80 @@ def test_transformer_pipeline_tagger_senter_listener():
     text = "We're interested at underwater basket weaving."
     doc = nlp(text)
     doc_tensor = tagger_trf.predict([doc])
-    assert_equal(doc._.trf_data.tensors, doc_tensor[0].tensors)
+    _assert_equal_tensors(doc._.trf_data.tensors, doc_tensor[0].tensors)
 
     # ensure IO goes OK
     with make_tempdir() as d:
         file_path = d / "trained_nlp"
         nlp.to_disk(file_path)
         nlp2 = util.load_model_from_path(file_path)
-        doc = nlp2(text)
+        doc2 = nlp2(text)
         tagger2 = nlp2.get_pipe("tagger")
         tagger_trf2 = tagger2.model.get_ref("tok2vec").layers[0]
-        doc_tensor2 = tagger_trf2.predict([doc])
-        assert_equal(doc_tensor2[0].tensors, doc_tensor[0].tensors)
+        doc_tensor2 = tagger_trf2.predict([doc2])
+        _assert_equal_tensors(doc_tensor2[0].tensors, doc_tensor[0].tensors)
+
+        # make sure that this can be saved to directory once more
+        file_path_2 = d / "trained_nlp_2"
+        nlp2.to_disk(file_path_2)
 
     # ensure to_bytes / from_bytes works
     nlp_bytes = nlp.to_bytes()
     nlp3 = util.load_model_from_config(orig_config, auto_fill=True, validate=True)
     nlp3.from_bytes(nlp_bytes)
-    doc = nlp3(text)
+    doc3 = nlp3(text)
     tagger3 = nlp3.get_pipe("tagger")
     tagger_trf3 = tagger3.model.get_ref("tok2vec").layers[0]
-    doc_tensor3 = tagger_trf3.predict([doc])
-    assert_equal(doc_tensor3[0].tensors, doc_tensor[0].tensors)
+    doc_tensor3 = tagger_trf3.predict([doc3])
+    _assert_equal_tensors(doc_tensor3[0].tensors, doc_tensor[0].tensors)
+
+
+def test_transformer_sentencepiece_IO():
+    """Test that a transformer using sentencepiece trains + IO goes OK"""
+    orig_config = Config().from_str(cfg_string)
+    orig_config["components"]["transformer"]["model"]["name"] = "camembert-base"
+    nlp = util.load_model_from_config(orig_config, auto_fill=True, validate=True)
+    tagger = nlp.get_pipe("tagger")
+    tagger_trf = tagger.model.get_ref("tok2vec").layers[0]
+    train_examples = []
+    for t in TRAIN_DATA:
+        train_examples.append(Example.from_dict(nlp.make_doc(t[0]), t[1]))
+        for tag in t[1]["tags"]:
+            tagger.add_label(tag)
+
+    optimizer = nlp.initialize(lambda: train_examples)
+    for i in range(2):
+        losses = {}
+        nlp.update(train_examples, sgd=optimizer, losses=losses)
+
+    text = "We're interested at underwater basket weaving."
+    doc = nlp(text)
+    doc_tensor = tagger_trf.predict([doc])
+
+    # ensure IO goes OK
+    with make_tempdir() as d:
+        file_path = d / "trained_nlp"
+        nlp.to_disk(file_path)
+        nlp2 = util.load_model_from_path(file_path)
+        doc2 = nlp2(text)
+        tagger2 = nlp2.get_pipe("tagger")
+        tagger_trf2 = tagger2.model.get_ref("tok2vec").layers[0]
+        doc_tensor2 = tagger_trf2.predict([doc2])
+        _assert_equal_tensors(doc_tensor2[0].tensors, doc_tensor[0].tensors)
+
+        # make sure that this can be saved to directory once more
+        file_path_2 = d / "trained_nlp_2"
+        nlp2.to_disk(file_path_2)
+
+    # ensure to_bytes / from_bytes works
+    nlp_bytes = nlp.to_bytes()
+    nlp3 = util.load_model_from_config(orig_config, auto_fill=True, validate=True)
+    nlp3.from_bytes(nlp_bytes)
+    doc3 = nlp3(text)
+    tagger3 = nlp3.get_pipe("tagger")
+    tagger_trf3 = tagger3.model.get_ref("tok2vec").layers[0]
+    doc_tensor3 = tagger_trf3.predict([doc3])
+    _assert_equal_tensors(doc_tensor3[0].tensors, doc_tensor[0].tensors)
 
 
 def test_transformer_pipeline_empty():
@@ -251,6 +301,9 @@ def test_transformer_pipeline_empty():
     nlp.update(train_examples, sgd=optimizer, losses=losses)
     nlp.update([empty_train_example], sgd=optimizer, losses=losses)
     train_examples.append(empty_train_example)
+    nlp.update(train_examples, sgd=optimizer, losses=losses)
+    # Interleave an empty doc between non-empty ones
+    train_examples.insert(1, Example.from_dict(nlp.make_doc(""), {}))
     nlp.update(train_examples, sgd=optimizer, losses=losses)
 
     # predict empty doc
@@ -324,7 +377,9 @@ def test_replace_listeners():
     )
     doc2 = nlp(text)
     assert preds == [t.tag_ for t in doc2]
-    assert_equal(doc_tensor, tagger_tok2vec.predict([doc2]))
+    pred_tensor = tagger_tok2vec.predict([doc2])
+    _assert_equal_tensors(doc_tensor, pred_tensor)
+
     # attempt training with the new pipeline
     optimizer = nlp.resume_training()
     for i in range(2):
@@ -335,6 +390,18 @@ def test_replace_listeners():
     # check for presence of additional fields in model_output
     assert doc2._.trf_data.model_output.pooler_output is not None
     assert doc2._.trf_data.model_output.attentions is not None
+
+    # ensure IO goes OK
+    doc_tensor_trained = tagger_tok2vec.predict([doc])
+    with make_tempdir() as d:
+        file_path = d / "trained_nlp"
+        nlp.to_disk(file_path)
+        nlp2 = util.load_model_from_path(file_path)
+        doc3 = nlp2(text)
+        tagger2 = nlp2.get_pipe("tagger")
+        tagger_tok2vec2 = tagger2.model.get_ref("tok2vec")
+        pred_tensor = tagger_tok2vec2.predict([doc3])
+        _assert_equal_tensors(doc_tensor_trained, pred_tensor)
 
 
 def test_replace_listeners_invalid():
@@ -376,3 +443,174 @@ def test_multiprocessing(simple_nlp, texts):
 
         for doc, expected_doc in zip(docs, expecteds):
             assert_docs_equal(doc, expected_doc)
+
+
+def test_frozen_listener():
+    orig_config = Config().from_str(cfg_string)
+    nlp = util.load_model_from_config(orig_config, auto_fill=True, validate=True)
+    text = "This is awesome"
+    examples = [Example.from_dict(nlp.make_doc(text), {"tags": ["A", "B", "C"]})]
+    optimizer = nlp.initialize(lambda: examples)
+    # train pipe before freezing listener
+    for i in range(2):
+        losses = {}
+        nlp.update(examples, sgd=optimizer, losses=losses)
+        doc = nlp(text)
+
+    transformer_bytes = nlp.get_pipe("transformer").to_bytes()
+    tagger_bytes = nlp.get_pipe("tagger").to_bytes()
+
+    # train further with frozen listener
+    for i in range(2):
+        losses = {}
+        nlp.update(
+            examples,
+            sgd=optimizer,
+            losses=losses,
+            exclude=["transformer"],
+            annotates=["transformer"],
+        )
+        doc = nlp(text)
+
+    # only tagger was updated
+    assert nlp.get_pipe("transformer").to_bytes() == transformer_bytes
+    assert nlp.get_pipe("tagger").to_bytes() != tagger_bytes
+
+
+def test_no_update_listener_in_predict():
+    orig_config = Config().from_str(cfg_string)
+    nlp = util.load_model_from_config(orig_config, auto_fill=True, validate=True)
+    listener = nlp.get_pipe("tagger").model.get_ref("tok2vec").get_ref("listener")
+    transformer = nlp.get_pipe("transformer")
+
+    text = "This is awesome"
+    examples = [Example.from_dict(nlp.make_doc(text), {"tags": ["A", "B", "C"]})]
+    docs = [eg.predicted for eg in examples]
+    nlp.initialize(lambda: examples)
+
+    transformer.update(examples)
+    assert listener._backprop is not None
+
+    transformer.predict(docs)
+    assert listener._backprop is not None
+
+
+@pytest.mark.skipif(
+    Version(spacy.__version__) < Version("3.5.4"), reason="Bug fixed in spaCy v3.5.4"
+)
+def test_source_replace_listeners():
+    """Test that a pipeline with a transformer+tagger+senter and some replaced
+    listeners runs and trains properly"""
+    orig_config = """
+    [nlp]
+    lang = "en"
+    pipeline = ["transformer","tagger","senter"]
+
+    [components]
+
+    [components.senter]
+    factory = "senter"
+
+    [components.senter.model]
+    @architectures = "spacy.Tagger.v1"
+    nO = null
+
+    [components.senter.model.tok2vec]
+    @architectures = "spacy-transformers.TransformerListener.v1"
+    grad_factor = 1.0
+    upstream = "transformer"
+
+    [components.senter.model.tok2vec.pooling]
+    @layers = "reduce_mean.v1"
+
+    [components.tagger]
+    factory = "tagger"
+
+    [components.tagger.model]
+    @architectures = "spacy.Tagger.v1"
+    nO = null
+
+    [components.tagger.model.tok2vec]
+    @architectures = "spacy-transformers.TransformerListener.v1"
+    grad_factor = 1.0
+    upstream = "transformer"
+
+    [components.tagger.model.tok2vec.pooling]
+    @layers = "reduce_mean.v1"
+
+    [components.transformer]
+    factory = "transformer"
+
+    [components.transformer.model]
+    @architectures = "spacy-transformers.TransformerModel.v3"
+    name = "distilbert-base-uncased"
+    """
+    orig_config = Config().from_str(cfg_string)
+    nlp = util.load_model_from_config(orig_config, auto_fill=True, validate=True)
+    assert nlp.pipe_names == ["transformer", "tagger", "senter"]
+    tagger = nlp.get_pipe("tagger")
+    train_examples = []
+    for t in TRAIN_DATA:
+        train_examples.append(Example.from_dict(nlp.make_doc(t[0]), t[1]))
+        for tag in t[1]["tags"]:
+            tagger.add_label(tag)
+    optimizer = nlp.initialize(lambda: train_examples)
+    assert nlp.get_pipe("transformer").listening_components == ["tagger", "senter"]
+    for i in range(2):
+        losses = {}
+        nlp.update(train_examples, sgd=optimizer, losses=losses)
+
+    with make_tempdir() as dir_path:
+        nlp.to_disk(dir_path)
+        base_model = str(dir_path)
+        new_config = {
+            "nlp": {
+                "lang": "en",
+                "pipeline": ["transformer", "tagger", "senter", "ner"],
+            },
+            "components": {
+                "transformer": {"source": base_model},
+                "tagger": {
+                    "source": base_model,
+                    "replace_listeners": ["model.tok2vec"],
+                },
+                "senter": {
+                    "source": base_model,
+                    "replace_listeners": ["model.tok2vec"],
+                },
+                "ner": {
+                    "factory": "ner",
+                    "model": {
+                        "@architectures": "spacy.TransitionBasedParser.v2",
+                        "state_type": "ner",
+                        "tok2vec": {
+                            "@architectures": "spacy-transformers.TransformerListener.v1",
+                            "grad_factor": 1.0,
+                            "upstream": "transformer",
+                            "pooling": {"@layers": "reduce_mean.v1"},
+                        },
+                    },
+                },
+            },
+        }
+        new_nlp = util.load_model_from_config(new_config, auto_fill=True)
+        for component in ("tagger", "senter"):
+            assert (
+                new_nlp.config["components"][component]["model"]["tok2vec"][
+                    "@architectures"
+                ]
+                == "spacy-transformers.Tok2VecTransformer.v3"
+            )
+        assert new_nlp.get_pipe("transformer").listening_components == ["ner"]
+
+        with make_tempdir() as new_dir_path:
+            new_nlp.to_disk(new_dir_path)
+            new_nlp_re = spacy.load(new_dir_path)
+            for component in ("tagger", "senter"):
+                assert (
+                    new_nlp.config["components"][component]["model"]["tok2vec"][
+                        "@architectures"
+                    ]
+                    == "spacy-transformers.Tok2VecTransformer.v3"
+                )
+            assert new_nlp_re.get_pipe("transformer").listening_components == ["ner"]

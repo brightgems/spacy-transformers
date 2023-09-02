@@ -3,7 +3,7 @@ from spacy.training.example import Example
 from spacy.util import make_tempdir
 from spacy import util
 from thinc.api import Model, Config
-from numpy.testing import assert_equal
+from .util import _assert_equal_tensors
 
 # fmt: off
 TRAIN_DATA = [
@@ -28,7 +28,7 @@ cfg_string = """
 
     [components.tagger.model.tok2vec]
     @architectures = "spacy-transformers.Tok2VecTransformer.v1"
-    name = "roberta-base"
+    name = "distilbert-base-uncased"
     tokenizer_config = {"use_fast": false}
     grad_factor = 1.0
 
@@ -78,7 +78,7 @@ def test_transformer_pipeline_tagger_internal():
         tagger_trf2 = tagger2.model.get_ref("tok2vec").layers[0]
         doc_tensor2 = tagger_trf2.predict([doc2])
         with pytest.raises(AssertionError):
-            assert_equal(
+            _assert_equal_tensors(
                 doc_tensor2.doc_data[0].tensors, doc_tensor.doc_data[0].tensors
             )
 
@@ -89,4 +89,6 @@ def test_transformer_pipeline_tagger_internal():
         tagger3 = nlp3.get_pipe("tagger")
         tagger_trf3 = tagger3.model.get_ref("tok2vec").layers[0]
         doc_tensor3 = tagger_trf3.predict([doc3])
-        assert_equal(doc_tensor3.doc_data[0].tensors, doc_tensor.doc_data[0].tensors)
+        _assert_equal_tensors(
+            doc_tensor3.doc_data[0].tensors, doc_tensor.doc_data[0].tensors
+        )

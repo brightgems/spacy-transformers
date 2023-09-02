@@ -3,24 +3,16 @@ from io import BytesIO
 from pathlib import Path
 import srsly
 import torch
-from dataclasses import dataclass, field
+import warnings
+from thinc.api import get_torch_default_device
 from spacy.util import SimpleFrozenDict
-from spacy.vectors import get_current_ops
 
+from ..data_classes import HFObjects
 from ..util import make_tempdir
 
 from thinc.api import PyTorchGradScaler, PyTorchShim
 
 from transformers import AutoModel, AutoConfig, AutoTokenizer
-
-
-@dataclass
-class HFObjects:
-
-    tokenizer: Any
-    transformer: Any
-    _init_tokenizer_config: Dict[str, Any] = field(default_factory=dict)
-    _init_transformer_config: Dict[str, Any] = field(default_factory=dict)
 
 
 class HFShim(PyTorchShim):
@@ -33,8 +25,14 @@ class HFShim(PyTorchShim):
         optimizer: Any = None,
         mixed_precision: bool = False,
         grad_scaler_config: dict = {},
+        config_cls=AutoConfig,
+        model_cls=AutoModel,
+        tokenizer_cls=AutoTokenizer,
     ):
         self._hfmodel = model
+        self.config_cls = config_cls
+        self.model_cls = model_cls
+        self.tokenizer_cls = tokenizer_cls
 
         # Enable gradient scaling when mixed precision is enabled and gradient
         # scaling is not explicitly disabled in the configuration.
@@ -61,6 +59,13 @@ class HFShim(PyTorchShim):
             config = hf_model.transformer.config.to_dict()
             tokenizer = hf_model.tokenizer
             with make_tempdir() as temp_dir:
+                if hasattr(tokenizer, "vocab_file"):
+                    vocab_file_name = tokenizer.vocab_files_names["vocab_file"]
+                    vocab_file_path = str((temp_dir / vocab_file_name).absolute())
+                    with open(vocab_file_path, "wb") as fileh:
+                        fileh.write(hf_model.vocab_file_contents)
+                    tokenizer.vocab_file = vocab_file_path
+                tok_dict["kwargs"] = {"use_fast": tokenizer.is_fast}
                 tokenizer.save_pretrained(str(temp_dir.absolute()))
                 for x in temp_dir.glob("**/*"):
                     if x.is_file():
@@ -89,26 +94,54 @@ class HFShim(PyTorchShim):
             with make_tempdir() as temp_dir:
                 config_file = temp_dir / "config.json"
                 srsly.write_json(config_file, config_dict)
-                config = AutoConfig.from_pretrained(config_file)
+                config = self.config_cls.from_pretrained(config_file)
+                tok_kwargs = tok_dict.pop("kwargs", {})
                 for x, x_bytes in tok_dict.items():
                     Path(temp_dir / x).write_bytes(x_bytes)
-                tokenizer = AutoTokenizer.from_pretrained(str(temp_dir.absolute()))
+                tokenizer = self.tokenizer_cls.from_pretrained(
+                    str(temp_dir.absolute()), **tok_kwargs
+                )
+                vocab_file_contents = None
+                if hasattr(tokenizer, "vocab_file"):
+                    vocab_file_name = tokenizer.vocab_files_names["vocab_file"]
+                    vocab_file_path = str((temp_dir / vocab_file_name).absolute())
+                    with open(vocab_file_path, "rb") as fileh:
+                        vocab_file_contents = fileh.read()
 
-            transformer = AutoModel.from_config(config)
+            transformer = self.model_cls.from_config(config)
             self._hfmodel = HFObjects(
-                tokenizer, transformer, SimpleFrozenDict(), SimpleFrozenDict()
+                tokenizer,
+                transformer,
+                vocab_file_contents,
+                SimpleFrozenDict(),
+                SimpleFrozenDict(),
             )
             self._model = transformer
             filelike = BytesIO(msg["state"])
             filelike.seek(0)
-            ops = get_current_ops()
-            if ops.device_type == "cpu":
-                map_location = "cpu"
-            else:  # pragma: no cover
-                device_id = torch.cuda.current_device()
-                map_location = f"cuda:{device_id}"
-            self._model.load_state_dict(torch.load(filelike, map_location=map_location))
-            self._model.to(map_location)
+            device = get_torch_default_device()
+            try:
+                self._model.load_state_dict(torch.load(filelike, map_location=device))
+            except RuntimeError as ex:
+                warn_msg = (
+                    "Error loading saved torch model. If the error is related "
+                    "to unexpected key(s) in state_dict, a possible workaround "
+                    "is to load this model with 'transformers<4.31'. "
+                    "Alternatively, download a newer compatible model or "
+                    "retrain your custom model with the current "
+                    "transformers and spacy-transformers versions. For more "
+                    "details and available updates, run: python -m spacy "
+                    "validate"
+                )
+                warnings.warn(warn_msg)
+                raise ex
+            self._model.to(device)
         else:
-            self._hfmodel = HFObjects(None, None, msg["_init_tokenizer_config"], msg["_init_transformer_config"])
+            self._hfmodel = HFObjects(
+                None,
+                None,
+                None,
+                msg["_init_tokenizer_config"],
+                msg["_init_transformer_config"],
+            )
         return self

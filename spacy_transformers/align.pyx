@@ -1,18 +1,28 @@
-import numpy
+# cython: infer_types=True, boundscheck=False
 from typing import cast, Dict, List, Tuple, Callable, Set, Optional
+import numpy
 from spacy_alignments.tokenizations import get_alignments
 from spacy.tokens import Span, Token
 from thinc.api import Ops
-from thinc.types import Ragged, Floats2d, Ints1d
+from thinc.types import Ragged, Floats2d, Ints1d, Ints2d
+
+from cython.operator cimport dereference as deref
+from cython.operator cimport preincrement as preinc
+from libc.stdint cimport uint32_t, int32_t, int64_t
+from libc.stdlib cimport free
+from libcpp.unordered_set cimport unordered_set
+from libcpp.vector cimport vector
+
+ctypedef unordered_set[uint32_t]* unordered_set_uint32_t_ptr
 
 
 def apply_alignment(ops: Ops, align: Ragged, X: Floats2d) -> Tuple[Ragged, Callable]:
     """Align wordpiece data (X) to match tokens, and provide a callback to
     reverse it.
- 
+
     This function returns a Ragged array, which represents the fact that one
     token may be aligned against multiple wordpieces. It's a nested list,
-    concatenated with a lengths array to indicate the nested structure. 
+    concatenated with a lengths array to indicate the nested structure.
 
     The alignment is also a Ragged array, where the lengths indicate how many
     wordpieces each token is aligned against. The output ragged therefore has
@@ -26,7 +36,7 @@ def apply_alignment(ops: Ops, align: Ragged, X: Floats2d) -> Tuple[Ragged, Calla
             Y[i] = X[index]
 
     Which is vectorized via numpy advanced indexing:
-        
+
         Y = X[align.data]
 
     The inverse operation, for the backward pass, uses the 'scatter_add' op
@@ -68,35 +78,44 @@ def _apply_empty_alignment(ops, align, X):
 
 def get_token_positions(spans: List[Span]) -> Dict[Token, int]:
     token_positions: Dict[Token, int] = {}
+    seen_docs = set()
     for span in spans:
+        if span.doc in seen_docs:
+            continue
+        seen_docs.add(span.doc)
         for token in span.doc:
             if token not in token_positions:
                 token_positions[token] = len(token_positions)
     return token_positions
 
 
-def get_alignment_via_offset_mapping(spans: List[Span], token_data) -> Ragged:
-    # This function uses the offset mapping provided by Huggingface. I'm not
-    # sure whether there's a bug here but I'm getting weird errors.
+def get_alignment_via_offset_mapping(
+    spans: List[Span],
+    offset_mapping: Ints2d,
+) -> Ragged:
+    if len(spans) != len(offset_mapping):
+        raise ValueError("Cannot align batches of different sizes.")
     # Tokens can occur more than once, and we need the alignment of each token
     # to its place in the concatenated wordpieces array.
     token_positions = get_token_positions(spans)
     alignment: List[Set[int]] = [set() for _ in range(len(token_positions))]
     wp_start = 0
     for i, span in enumerate(spans):
-        for j, token in enumerate(span):
+        span_offset_mapping = offset_mapping[i]
+        span2wp = get_span2wp_from_offset_mapping(span, span_offset_mapping)
+        for token, wp_js in zip(span, span2wp):
             position = token_positions[token]
-            for char_idx in range(token.idx, token.idx + len(token)):
-                wp_j = token_data.char_to_token(i, char_idx)
-                if wp_j is not None:
-                    alignment[position].add(wp_start + wp_j)
-        wp_start += len(token_data.input_ids[i])
+            alignment[position].update(wp_start + j for j in wp_js)
+        wp_start += span_offset_mapping.shape[0]
     lengths: List[int] = []
     flat: List[int] = []
     for a in alignment:
         lengths.append(len(a))
         flat.extend(sorted(a))
-    align = Ragged(numpy.array(flat, dtype="i"), numpy.array(lengths, dtype="i"))
+    align = Ragged(
+        cast(Ints1d, numpy.array(flat, dtype="i")),
+        cast(Ints1d, numpy.array(lengths, dtype="i")),
+    )
     return align
 
 
@@ -108,7 +127,7 @@ def get_alignment(
     """Compute a ragged alignment array that records, for each unique token in
     `spans`, the corresponding indices in the flattened `wordpieces` array.
     For instance, imagine you have two overlapping spans:
-    
+
         [[I, like, walking], [walking, outdoors]]
 
     And their wordpieces are:
@@ -168,5 +187,78 @@ def get_alignment(
     for a in alignment:
         lengths.append(len(a))
         flat.extend(sorted(a))
-    align = Ragged(numpy.array(flat, dtype="i"), numpy.array(lengths, dtype="i"))
+    align = Ragged(
+        cast(Ints1d, numpy.array(flat, dtype="i")),
+        cast(Ints1d, numpy.array(lengths, dtype="i")),
+    )
     return align
+
+
+def get_span2wp_from_offset_mapping(span, wp_char_offsets):
+    # create a mapping of char indices to spacy token indices
+    cdef int span_idx = span[0].idx
+    cdef int span_i = span[0].i
+    cdef int char_idx, rel_token_i
+    # size is +1 so we don't have to check whether the text has a trailing space
+    char_to_sp_token = numpy.full((len(span.text) + 1,), -1, dtype="int32")
+    for token in span:
+        rel_token_i = token.i - span_i
+        for char_idx in range(
+                token.idx - span_idx,
+                token.idx - span_idx + len(token) + 1,
+        ):
+            char_to_sp_token[char_idx] = rel_token_i
+
+    # align all wordpiece tokens to one or more spacy token indices
+    cdef vector[unordered_set_uint32_t_ptr] alignment
+    for _ in range(len(span)):
+        alignment.push_back(new unordered_set[uint32_t]())
+    _get_span2wp_alignment(
+        &alignment,
+        numpy.ascontiguousarray(char_to_sp_token),
+        char_to_sp_token.size,
+        numpy.ascontiguousarray(wp_char_offsets, dtype="int64"),
+        wp_char_offsets.shape[0],
+    )
+
+    # convert the alignment into a list of aligned wordpiece indices per spacy
+    # token index (unsorted at this point)
+    cdef unordered_set_uint32_t_ptr s
+    cdef vector[unordered_set_uint32_t_ptr].iterator it_v = alignment.begin()
+    cdef unordered_set[uint32_t].iterator it_s
+    result: List[List[int]] = []
+    while it_v != alignment.end():
+        result.append([])
+        s = deref(it_v)
+        it_s = s.begin()
+        while it_s != s.end():
+            result[-1].append(deref(it_s))
+            preinc(it_s)
+        del s
+        preinc(it_v)
+    return result
+
+
+cdef void _get_span2wp_alignment(
+        vector[unordered_set_uint32_t_ptr]* alignment,
+        int32_t[::1] char_to_sp_token,
+        int char_to_sp_token_length,
+        int64_t[:, ::1] wp_char_offsets,
+        int wp_char_offsets_length,
+    ) nogil:
+    cdef int char_idx, start_idx, end_idx, token_i
+    cdef int wp_j = 0
+    cdef int alignment_size = alignment.size()
+    while wp_j < wp_char_offsets_length:
+        start_idx = wp_char_offsets[wp_j][0]
+        end_idx = wp_char_offsets[wp_j][1]
+        char_idx = start_idx
+        while char_idx < end_idx:
+            if 0 <= char_idx < char_to_sp_token_length:
+                token_i = char_to_sp_token[char_idx]
+            else:
+                token_i = -1
+            if 0 <= token_i < alignment_size:
+                deref(alignment.at(token_i)).insert(wp_j)
+            char_idx += 1
+        wp_j += 1

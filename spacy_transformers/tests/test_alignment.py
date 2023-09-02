@@ -1,10 +1,12 @@
 import pytest
 from typing import List
+import numpy
 from spacy.tokens import Doc
 from spacy.vocab import Vocab
 from thinc.api import NumpyOps
 from thinc.types import Ragged
 from ..align import get_alignment, apply_alignment
+from ..align import get_span2wp_from_offset_mapping
 
 
 def get_ragged(ops, nested: List[List[int]]):
@@ -50,7 +52,7 @@ def test_alignments_match(words1, words2):
     assert len(unique_tokens) == align.lengths.shape[0]
     flat_words1, flat_words2 = flatten_strings(words1, words2)
     for i, word in enumerate(flat_words1):
-        wp_word = "".join([flat_words2[int(j)] for j in align[i].data])
+        wp_word = "".join([flat_words2[int(j[0])] for j in align[i].data])
         if len(word) < len(wp_word):
             assert word in wp_word
         elif len(word) > len(wp_word):
@@ -78,3 +80,27 @@ def test_apply_alignment(nested_align, X_cols):
     assert Y.lengths.shape[0] == len(nested_align)
     dX = get_dX(Y)
     assert dX.shape == X.shape
+
+
+@pytest.mark.parametrize(
+    # fmt: off
+    # roberta-base offset_mapping and expected alignment
+    "words,offset_mapping,alignment",
+    [
+        (
+            ["Áaaa"],
+            numpy.asarray([(0, 0), (0, 1), (0, 1), (1, 4), (0, 0)], dtype="i"),
+            [[1, 2, 3]],
+        ),
+        (
+            ["INGG", "á", "aäa"],
+            numpy.asarray([(0, 0), (0, 3), (3, 4), (5, 6), (5, 6), (7, 8), (8, 9), (9, 10), (0, 0)], dtype="i"),
+            [[1, 2], [3, 4], [5, 6, 7]],
+        ),
+    ],
+    # fmt: on
+)
+def test_offset_alignment(words, offset_mapping, alignment):
+    spans = get_spans([words])
+    result = get_span2wp_from_offset_mapping(spans[0], offset_mapping)
+    assert all(sorted(r) == a for r, a in zip(result, alignment))
