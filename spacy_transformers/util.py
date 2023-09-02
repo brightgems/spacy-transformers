@@ -1,9 +1,7 @@
-import os.path as osp
 from typing import List, Dict, Union, Set
 from pathlib import Path
-import os.path as osp
 import random
-from transformers import AutoModel, AutoConfig, AutoTokenizer, BertTokenizer, BertJapaneseTokenizer
+from transformers import AutoModel, AutoConfig, AutoTokenizer
 from transformers.tokenization_utils import BatchEncoding
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 import catalogue
@@ -41,21 +39,9 @@ def huggingface_from_pretrained(source: Union[Path, str], config: Dict):
         str_path = str(source.absolute())
     else:
         str_path = source
-    # automatically load BertTokenizer if vocab.txt exists in model_name_or_path
-    bert_vocab_file = 'vocab.txt'
-    is_path = osp.isdir(str_path)
-    bert_tokenizer_class = None
-    if is_path and osp.exists(osp.join(str_path, bert_vocab_file)):
-        bert_tokenizer_class = BertJapaneseTokenizer if ('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
-    elif not is_path and 'bert' in str_path:
-        bert_tokenizer_class = BertJapaneseTokenizer if ('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
-    if bert_tokenizer_class:
-        tokenizer = bert_tokenizer_class.from_pretrained(str_path, **tok_config)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(str_path, **tok_config)
-    trf_config["return_dict"] = True
-    configs = AutoConfig.from_pretrained(str_path, **trf_config)
-    transformer = AutoModel.from_pretrained(str_path, config=configs)
+
+    tokenizer = AutoTokenizer.from_pretrained(str_path, **config)
+    transformer = AutoModel.from_pretrained(str_path)
     torch_device = get_torch_default_device()
     transformer.to(torch_device)
     return tokenizer, transformer

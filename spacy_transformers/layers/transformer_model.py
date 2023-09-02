@@ -1,8 +1,9 @@
 from typing import List, Tuple, Callable, Union, Dict
 import copy
+import os.path as osp
 from pathlib import Path
 from transformers.file_utils import ModelOutput
-from transformers import AutoConfig, AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer, BertTokenizer, BertJapaneseTokenizer
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 from transformers.tokenization_utils import BatchEncoding
 
@@ -264,6 +265,20 @@ def huggingface_from_pretrained(
         str_path = str(source.absolute())
     else:
         str_path = source
+    # region automatically load BertTokenizer if vocab.txt exists in model_name_or_path
+
+    bert_vocab_file = 'vocab.txt'
+    is_path = osp.isdir(str_path)
+    bert_tokenizer_class = None
+    if is_path and osp.exists(osp.join(str_path, bert_vocab_file)):
+        bert_tokenizer_class = BertJapaneseTokenizer if ('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
+    elif not is_path and 'bert' in str_path:
+        bert_tokenizer_class = BertJapaneseTokenizer if ('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
+    if bert_tokenizer_class:
+        tokenizer = bert_tokenizer_class.from_pretrained(str_path, **tok_config)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(str_path, **tok_config)
+    # endregion
     tokenizer = tokenizer_cls.from_pretrained(str_path, **tok_config)
     vocab_file_contents = None
     if hasattr(tokenizer, "vocab_file"):
