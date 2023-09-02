@@ -12,6 +12,7 @@ from thinc.api import Model, get_torch_default_device, xp2torch
 from thinc.types import ArgsKwargs
 
 import logging
+import json
 
 from ..data_classes import FullTransformerBatch, WordpieceBatch, HFObjects
 from ..util import maybe_flush_pytorch_cache
@@ -21,7 +22,32 @@ from ..truncate import truncate_oversize_splits
 from ..align import get_alignment, get_alignment_via_offset_mapping
 from .hf_wrapper import HFWrapper
 
-
+import requests  
+  
+def download_tokenizer(model_path):  
+    config_file = osp.join(model_path, 'config.json')
+    if not osp.exists(config_file):
+        return False
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+    if not config.get('_name_or_path'):
+        return False
+    model_name = config['_name_or_path']
+    url = f"https://huggingface.co/{model_name}/resolve/main/tokenizer.json"
+    try:
+        response = requests.get(url)  
+    except:
+        return False
+  
+    if response.status_code == 200:  
+        with open(osp.join(model_path, "tokenizer.json"), "wb") as f:  
+            f.write(response.content)  
+        print(f"Downloaded tokenizer.json for {model_name}")  
+        return True
+    else:  
+        print(f"Failed to download tokenizer.json for {model_name}")  
+        return False
+  
 class TransformerModel(Model):
     def __init__(
         self,
@@ -265,8 +291,17 @@ def huggingface_from_pretrained(
         str_path = str(source.absolute())
     else:
         str_path = source
-    # region automatically load BertTokenizer if vocab.txt exists in model_name_or_path
-
+    # region safecode for transformers tokenizer
+    # if use_fast=True, check if tokenizer.json exists
+    TOKENIZER_FILE = "tokenizer.json"
+    if tok_config.get('use_fast')==True:
+        tokenizer_fp = osp.join(str_path, TOKENIZER_FILE)
+        if not osp.exists(tokenizer_fp):
+            suc = download_tokenizer(str_path)
+            if not suc:
+                tok_config['use_fast'] = False
+        
+    # automatically load BertTokenizer if vocab.txt exists in model_name_or_path
     bert_vocab_file = 'vocab.txt'
     is_path = osp.isdir(str_path)
     bert_tokenizer_class = None
@@ -275,9 +310,11 @@ def huggingface_from_pretrained(
     elif not is_path and 'bert' in str_path:
         bert_tokenizer_class = BertJapaneseTokenizer if ('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
     if bert_tokenizer_class:
+        tok_config['use_fast'] = False
         tokenizer = bert_tokenizer_class.from_pretrained(str_path, **tok_config)
     else:
         tokenizer = AutoTokenizer.from_pretrained(str_path, **tok_config)
+        
     # endregion
     tokenizer = tokenizer_cls.from_pretrained(str_path, **tok_config)
     vocab_file_contents = None
