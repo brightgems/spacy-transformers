@@ -292,9 +292,10 @@ def huggingface_from_pretrained(
     else:
         str_path = source
     # region safecode for transformers tokenizer
+    is_path = osp.isdir(str_path)
     # if use_fast=True, check if tokenizer.json exists
     TOKENIZER_FILE = "tokenizer.json"
-    if tok_config.get('use_fast')==True:
+    if is_path and tok_config.get('use_fast')==True:
         tokenizer_fp = osp.join(str_path, TOKENIZER_FILE)
         if not osp.exists(tokenizer_fp):
             suc = download_tokenizer(str_path)
@@ -303,14 +304,13 @@ def huggingface_from_pretrained(
         
     # automatically load BertTokenizer if vocab.txt exists in model_name_or_path
     bert_vocab_file = 'vocab.txt'
-    is_path = osp.isdir(str_path)
+    
     bert_tokenizer_class = None
-    if is_path and osp.exists(osp.join(str_path, bert_vocab_file)):
+    if is_path and tok_config['use_fast'] == False and osp.exists(osp.join(str_path, bert_vocab_file)):
         bert_tokenizer_class = BertJapaneseTokenizer if ('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
     elif not is_path and 'bert' in str_path:
         bert_tokenizer_class = BertJapaneseTokenizer if ('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
     if bert_tokenizer_class:
-        tok_config['use_fast'] = False
         tokenizer = bert_tokenizer_class.from_pretrained(str_path, **tok_config)
     else:
         tokenizer = AutoTokenizer.from_pretrained(str_path, **tok_config)
