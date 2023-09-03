@@ -22,32 +22,47 @@ from ..truncate import truncate_oversize_splits
 from ..align import get_alignment, get_alignment_via_offset_mapping
 from .hf_wrapper import HFWrapper
 
-import requests  
-  
-def download_tokenizer(model_path):  
-    config_file = osp.join(model_path, 'config.json')
-    if not osp.exists(config_file):
+import requests
+
+
+def check_tokenizer(model_path):
+    tc_file = osp.join(model_path, 'tokenizer_config.json')
+    if not osp.exists(tc_file):
         return False
+    with open(tc_file, 'r') as f:
+        config = json.load(f)
+    # albert don't have tokenizer.json file
+    if not config.get('special_tokens_map_file'):
+        return False
+    if not config['special_tokens_map_file'].startswith(model_path):
+        config['special_tokens_map_file'] = osp.join(model_path, 'special_tokens_map.json')
+        config['tokenizer_file'] = osp.join(model_path, 'tokenizer.json')
+        with open(tc_file, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+    tokenizer_fp = osp.join(model_path, "tokenizer.json")
+    if osp.exists(tokenizer_fp):
+        return True
+
+    config_file = osp.join(model_path, 'config.json')
     with open(config_file, 'r') as f:
         config = json.load(f)
-    if not config.get('_name_or_path'):
-        return False
     model_name = config['_name_or_path']
     url = f"https://huggingface.co/{model_name}/resolve/main/tokenizer.json"
     try:
-        response = requests.get(url)  
+        response = requests.get(url, timeout=15)
     except:
         return False
-  
-    if response.status_code == 200:  
-        with open(osp.join(model_path, "tokenizer.json"), "wb") as f:  
-            f.write(response.content)  
-        print(f"Downloaded tokenizer.json for {model_name}")  
+
+    if response.status_code == 200:
+        with open(tokenizer_fp, "wb") as f:
+            f.write(response.content)
+        print(f"Downloaded tokenizer.json for {model_name}")
         return True
-    else:  
-        print(f"Failed to download tokenizer.json for {model_name}")  
+    else:
+        print(f"Failed to download tokenizer.json for {model_name}")
         return False
-  
+
+
 class TransformerModel(Model):
     def __init__(
         self,
@@ -294,17 +309,15 @@ def huggingface_from_pretrained(
     # region safecode for transformers tokenizer
     is_path = osp.isdir(str_path)
     # if use_fast=True, check if tokenizer.json exists
-    TOKENIZER_FILE = "tokenizer.json"
-    if is_path and tok_config.get('use_fast')==True:
-        tokenizer_fp = osp.join(str_path, TOKENIZER_FILE)
-        if not osp.exists(tokenizer_fp):
-            suc = download_tokenizer(str_path)
-            if not suc:
-                tok_config['use_fast'] = False
-        
+    if is_path and tok_config.get('use_fast') == True:
+        # fast mode must have tokenizer.json
+        suc = check_tokenizer(str_path)
+        if not suc:
+            tok_config['use_fast'] = False
+
     # automatically load BertTokenizer if vocab.txt exists in model_name_or_path
     bert_vocab_file = 'vocab.txt'
-    
+
     bert_tokenizer_class = None
     if is_path and tok_config['use_fast'] == False and osp.exists(osp.join(str_path, bert_vocab_file)):
         bert_tokenizer_class = BertJapaneseTokenizer if ('japanese' in str_path or 'ja_' in str_path) else BertTokenizer
@@ -314,11 +327,10 @@ def huggingface_from_pretrained(
         tokenizer = bert_tokenizer_class.from_pretrained(str_path, **tok_config)
     else:
         tokenizer = AutoTokenizer.from_pretrained(str_path, **tok_config)
-        
+
     # endregion
-    tokenizer = tokenizer_cls.from_pretrained(str_path, **tok_config)
     vocab_file_contents = None
-    if hasattr(tokenizer, "vocab_file"):
+    if hasattr(tokenizer, "vocab_file"):                                                            
         with open(tokenizer.vocab_file, "rb") as fileh:
             vocab_file_contents = fileh.read()
     trf_config["return_dict"] = True
